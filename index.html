@@ -1,0 +1,1100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sushi Showdown</title>
+  <style>
+    :root {
+      --pink:#f2a8bd; --blush:#e7b5ca; --lavender:#b9a0d3;
+      --silver:#d8d3df; --plum:#382536; --midnight:#211821;
+    }
+    * { box-sizing:border-box; }
+    html, body {
+      width:100%; height:100%; margin:0; overflow:hidden;
+      background:#130d16; color:white;
+      font-family:"Trebuchet MS","Segoe UI",sans-serif;
+    }
+    body {
+      display:grid; place-items:center;
+      background:
+        radial-gradient(circle at 50% 20%, rgba(242,168,189,.10), transparent 38%),
+        #130d16;
+    }
+    #wrap {
+      width:min(100vw, calc(100vh * 16 / 9));
+      height:min(100vh, calc(100vw * 9 / 16));
+      position:relative;
+      box-shadow:0 0 60px rgba(242,168,189,.12);
+    }
+    canvas {
+      display:block; width:100%; height:100%;
+      cursor:default;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap"><canvas id="game" width="1280" height="720"></canvas></div>
+  <script>
+  "use strict";
+
+  // ==================== CONFIGURATION ====================
+  const CONFIG = {
+    requiredIngredients: 6,
+    wrongItemPenalty: 2,
+    aiShopDuration: 32,
+    aiAssemblyDuration: 38,
+    aiCutDuration: 42,
+    aiServeDuration: 34,
+    requiredRolls: 3,
+    ingredientsPerRoll: 4,
+    cuttingTolerance: 58,
+    conveyorSpeed: 115,
+    playerSpeed: 210,
+    requiredCustomers: 3
+  };
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const W = 1280, H = 720;
+  let gameState = "menu";
+  let paused = false;
+  let pausedAt = 0;
+  let lastTime = performance.now();
+  let sessionStart = 0;
+  let stageStart = 0;
+  let transitionUntil = 0;
+  let stageCompleteMessage = "";
+  let mouse = { x:0, y:0, down:false };
+  let keys = {};
+  let enterPressed = false;
+
+  const stats = {
+    shopTime: null,
+    assemblyAccuracy: null,
+    cuttingAccuracy: null,
+    servingTime: null,
+    assemblyCorrect: 0,
+    assemblyAttempts: 0,
+    cuttingCorrect: 0,
+    cuttingAttempts: 0,
+    cuttingResolved: 0
+  };
+
+  const requiredNames = ["Sushi rice","Nori","Salmon","Cucumber","Egg","Avocado"];
+  const shelfColors = ["#f3d28a","#386b55","#ef6f91","#98c96d","#ffd98a","#7bbd78","#ef8c72","#d8d3df","#f49aaf","#d0a8d8"];
+
+  let shop = {};
+  let assembly = {};
+  let cutting = {};
+  let serving = {};
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function lerp(a,b,t) { return a + (b-a)*t; }
+  function smooth(v) { return clamp(v,0,100); }
+  function elapsedSince(t) { return ((paused ? pausedAt : performance.now())-t)/1000; }
+
+  function togglePause() {
+    if (!paused) {
+      paused = true;
+      pausedAt = performance.now();
+      return;
+    }
+
+    const pauseDuration = performance.now() - pausedAt;
+    if (sessionStart) sessionStart += pauseDuration;
+    if (stageStart) stageStart += pauseDuration;
+    if (transitionUntil) transitionUntil += pauseDuration;
+    if (assembly.feedbackUntil) assembly.feedbackUntil += pauseDuration;
+    if (cutting.feedbackUntil) cutting.feedbackUntil += pauseDuration;
+    if (serving.feedbackUntil) serving.feedbackUntil += pauseDuration;
+    paused = false;
+    pausedAt = 0;
+    lastTime = performance.now();
+  }
+
+  function resetGame() {
+    gameState = "menu";
+    paused = false;
+    pausedAt = 0;
+    sessionStart = 0;
+    stageStart = 0;
+    transitionUntil = 0;
+    stageCompleteMessage = "";
+    keys = {};
+    enterPressed = false;
+    Object.assign(stats,{
+      shopTime:null, assemblyAccuracy:null, cuttingAccuracy:null, servingTime:null,
+      assemblyCorrect:0, assemblyAttempts:0, cuttingCorrect:0, cuttingAttempts:0,
+      cuttingResolved:0
+    });
+  }
+
+  // ==================== DRAWING HELPERS ====================
+  function roundedRect(x,y,w,h,r,fill,stroke,linewidth=2) {
+    ctx.beginPath();
+    ctx.roundRect(x,y,w,h,r);
+    if (fill) { ctx.fillStyle=fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle=stroke; ctx.lineWidth=linewidth; ctx.stroke(); }
+  }
+
+  function text(str,x,y,size=24,align="left",baseline="alphabetic",color="#fff",font="Trebuchet MS") {
+    ctx.save();
+    ctx.fillStyle=color; ctx.font=`${size}px ${font}`; ctx.textAlign=align; ctx.textBaseline=baseline;
+    ctx.fillText(str,x,y);
+    ctx.restore();
+  }
+
+  function star(x,y,r,color="#fff") {
+    ctx.save(); ctx.translate(x,y); ctx.fillStyle=color;
+    ctx.beginPath();
+    for (let i=0;i<8;i++) {
+      const a=i*Math.PI/4, rr=i%2?r*.25:r;
+      ctx.lineTo(Math.cos(a)*rr,Math.sin(a)*rr);
+    }
+    ctx.closePath(); ctx.fill(); ctx.restore();
+  }
+
+  function progressBar(x,y,w,label,value,color,icon) {
+    roundedRect(x,y,w,28,14,"rgba(33,24,33,.72)","rgba(216,211,223,.55)");
+    const pw=(w-8)*smooth(value)/100;
+    roundedRect(x+4,y+4,Math.max(0,pw),20,10,color,null);
+    ctx.save(); ctx.globalAlpha=.65; ctx.fillStyle="#fff";
+    ctx.fillRect(x+8,y+9,Math.max(0,pw*.62),2); ctx.restore();
+    text(icon||"",x-30,y+20,20,"center","middle","#e7b5ca");
+    text(label,x,y-8,17,"left","alphabetic","#fff");
+  }
+
+  function drawSushiRoll(cx,cy,scale=1,ingredientCount=4,vertical=false) {
+    ctx.save(); ctx.translate(cx,cy); ctx.scale(scale,scale);
+    if (vertical) {
+      ctx.rotate(-.05);
+      roundedRect(-58,-42,116,84,18,"#24151f","#e7b5ca",3);
+      ctx.beginPath(); ctx.arc(0,0,36,0,Math.PI*2); ctx.fillStyle="#f5ede2"; ctx.fill();
+      ctx.strokeStyle="#2d1c28"; ctx.lineWidth=12; ctx.stroke();
+      ctx.beginPath(); ctx.arc(0,0,26,0,Math.PI*2); ctx.fillStyle="#f2a8bd"; ctx.fill();
+      ctx.beginPath(); ctx.arc(0,0,13,0,Math.PI*2); ctx.fillStyle="#b9d58d"; ctx.fill();
+    } else {
+      roundedRect(-250,-48,500,96,12,"#2b1b25","#d8d3df",3);
+      ctx.fillStyle="#f5ede2"; ctx.fillRect(-238,-38,476,76);
+      ctx.fillStyle="#3c2a35"; ctx.fillRect(-238,-38,476,76);
+      ctx.fillStyle="#f5ede2";
+      for (let i=0;i<42;i++) ctx.fillRect(-230+(i%21)*22,-34+Math.floor(i/21)*42,18,34);
+      if (ingredientCount>=1) ctx.fillStyle="#4e6d39",ctx.fillRect(-220,-34,440,18);
+      if (ingredientCount>=2) ctx.fillStyle="#8fc4a4",ctx.fillRect(-220,-16,440,14);
+      if (ingredientCount>=3) ctx.fillStyle="#ef7d99",ctx.fillRect(-220,-2,440,24);
+      if (ingredientCount>=4) ctx.fillStyle="#f0b970",ctx.fillRect(-220,22,440,16);
+    }
+    ctx.restore();
+  }
+
+  function drawBackground(tint="rgba(56,37,54,.35)") {
+    const g=ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0,"#4a354f"); g.addColorStop(.6,"#352735"); g.addColorStop(1,"#1a1420");
+    ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle=tint; ctx.fillRect(0,0,W,H);
+    ctx.globalAlpha=.14;
+    ctx.fillStyle="#f2a8bd";
+    for(let i=0;i<28;i++) ctx.fillRect((i*173)%W,(i*97)%H,2,2);
+    ctx.globalAlpha=1;
+  }
+
+  function drawTopProgressHuman() {
+    progressBar(790,82,390,"Human","50","#f2a8bd","●");
+  }
+
+  // ==================== STATE TRANSITIONS ====================
+  function beginGame() {
+    resetGame();
+    sessionStart=performance.now();
+    startShopping();
+  }
+
+  function clearStageInputs() {
+    keys={}; mouse.down=false; enterPressed=false;
+  }
+
+  function startShopping() {
+    gameState="shop"; clearStageInputs(); stageStart=performance.now(); transitionUntil=0;
+    shop={
+      collected:[],
+      penaltySeconds:0,
+      wrongFlash:0,
+      positiveFlash:[],
+      cartBump:0,
+      complete:false
+    };
+    initShopItems();
+  }
+
+  function startAssembly() {
+    gameState="assembly"; clearStageInputs(); stageStart=performance.now(); transitionUntil=0;
+    assembly={
+      roll:0, step:0, feedback:"", feedbackKind:"", feedbackUntil:0,
+      question:null, choices:[], selected:-1, canAnswer:true,
+      aiBase:0
+    };
+    nextAssemblyQuestion();
+  }
+
+  function startCutting() {
+    gameState="cutting"; clearStageInputs(); stageStart=performance.now(); transitionUntil=0;
+    cutting={
+      roll:0, knifeY:0, knifePhase:0, feedback:"", feedbackKind:"",
+      feedbackUntil:0, activeRoll:null, betweenUntil:0,
+      sliceFlash:[]
+    };
+    spawnCuttingRoll();
+  }
+
+  function startServing() {
+    gameState="serving"; clearStageInputs(); stageStart=performance.now(); transitionUntil=0;
+    serving={
+      elapsed:0, served:0,
+      player:{x:120,y:610,r:15},
+      feedback:"", feedbackUntil:0,
+      customers:[
+        {x:1020,y:250,r:18,served:false,color:"#f49aaf"},
+        {x:725,y:540,r:18,served:false,color:"#d5a1d9"},
+        {x:1060,y:645,r:18,served:false,color:"#ffc0cf"}
+      ],
+      pedestrians:[
+        {x:500,y:220,dx:28,range:[410,660]},
+        {x:820,y:400,dx:-22,range:[730,1050]},
+        {x:470,y:630,dx:24,range:[360,650]}
+      ]
+    };
+  }
+
+  function finishShopping() {
+    if (shop.complete) return;
+    shop.complete=true;
+    stats.shopTime=elapsedSince(stageStart)+shop.penaltySeconds;
+    stageCompleteMessage="Shopping Complete!";
+    transitionUntil=performance.now()+1300;
+  }
+
+  function finishAssembly() {
+    stats.assemblyAccuracy=stats.assemblyAttempts?stats.assemblyCorrect/stats.assemblyAttempts*100:0;
+    stageCompleteMessage="Assembly Complete!";
+    transitionUntil=performance.now()+1300;
+  }
+
+  function finishCutting() {
+    stats.cuttingAccuracy=stats.cuttingAttempts?stats.cuttingCorrect/stats.cuttingAttempts*100:0;
+    stageCompleteMessage="Cutting Complete!";
+    transitionUntil=performance.now()+1300;
+  }
+
+  function finishServing() {
+    if (stats.servingTime!==null) return;
+    stats.servingTime=elapsedSince(stageStart);
+    stageCompleteMessage="All Orders Served!";
+    transitionUntil=performance.now()+1500;
+  }
+
+  function toEnding() {
+    gameState="ending"; clearStageInputs();
+  }
+
+  // ==================== MAIN MENU ====================
+  function drawMainMenu(t) {
+    drawBackground();
+
+    // restaurant window
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0,0,W,H); ctx.clip();
+    ctx.fillStyle="#d7a0bc"; ctx.fillRect(805,0,475,330);
+    ctx.fillStyle="#5f4b69"; ctx.fillRect(850,45,390,245);
+    ctx.fillStyle="#a5a0bd"; ctx.fillRect(915,75,260,180);
+    ctx.fillStyle="#33263a";
+    ctx.fillRect(1038,75,8,180); ctx.fillRect(915,158,260,8);
+    ctx.restore();
+
+    // cherry branches
+    ctx.strokeStyle="#3a2034"; ctx.lineWidth=8;
+    ctx.beginPath(); ctx.moveTo(-20,280); ctx.bezierCurveTo(100,210,90,80,210,-20); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(1010,330); ctx.bezierCurveTo(1120,210,1180,180,1300,130); ctx.stroke();
+    ctx.fillStyle="#f2a8bd";
+    for(let i=0;i<22;i++){
+      const x=(i*83)%620-20, y=(i*61)%260;
+      ctx.beginPath(); ctx.arc(x,y,7+(i%3)*2,0,Math.PI*2); ctx.fill();
+    }
+
+    // lanterns and counter
+    ctx.fillStyle="#bf777f";
+    roundedRect(40,280,170,420,20,"#2b1d29","#d8d3df",2);
+    ctx.fillStyle="#f2a8bd";
+    for(let i=0;i<3;i++){
+      ctx.beginPath(); ctx.ellipse(100+i*160,420,56,72,0,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle="rgba(255,220,195,.6)";
+      ctx.beginPath(); ctx.ellipse(100+i*160,420,34,55,0,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle="#f2a8bd";
+    }
+    roundedRect(0,625,W,95,0,"#4a2f42","#d8d3df",2);
+
+    ctx.save();
+    ctx.translate(640,205);
+    ctx.rotate(-.02);
+    text("Sushi",0,-72,118,"center","middle","#fff","Georgia");
+    text("Showdown",0,35,78,"center","middle","#f5dbe6","Georgia");
+    ctx.restore();
+    ctx.strokeStyle="rgba(216,211,223,.7)"; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.ellipse(640,205,370,115,-.08,0,Math.PI*2); ctx.stroke();
+    star(1000,95,18,"#fff");
+
+    roundedRect(320,330,640,100,28,"rgba(78,57,76,.78)","rgba(231,181,202,.78)",3);
+    text("Beat the AI sushi chef by making your sushi",640,365,28,"center","middle","#fff");
+    text("faster and better, or get fired.",640,405,28,"center","middle","#fff");
+
+    const bx=450, by=475, bw=380, bh=90;
+    const hover=mouse.x>=bx&&mouse.x<=bx+bw&&mouse.y>=by&&mouse.y<=by+bh;
+    ctx.shadowBlur=hover?38:22; ctx.shadowColor="#f2a8bd";
+    roundedRect(bx,by,bw,bh,22,hover?"#ffb1c8":"#e58fae","#ffd9e6",3);
+    ctx.shadowBlur=0;
+    text("▶  BEGIN",bx+bw/2,by+bh/2+3,42,"center","middle","#fff","Georgia");
+    text("LMC 2700  •  FINAL PROJECT",640,668,14,"center","middle","#d8d3df");
+
+    drawSushiRoll(205,650,.43,4,false);
+    drawSushiRoll(1075,650,.43,4,false);
+  }
+
+  // ==================== SHOP ====================
+  function initShopItems() {
+    const names=[...requiredNames,"Tomato","Cheese","Strawberry","Bread"];
+    const positions=[
+      [330,210],[510,210],[690,210],[870,210],[1050,210],[330,380],
+      [510,380],[690,380],[870,380],[1050,380]
+    ];
+    shop.items=names.map((name,i)=>({
+      name, x:positions[i][0], y:positions[i][1], collected:false,
+      required:requiredNames.includes(name), icon:i%10
+    }));
+  }
+
+  function drawIngredientIcon(item,x,y) {
+    ctx.save(); ctx.translate(x,y);
+    if(item.name==="Sushi rice"){ctx.fillStyle="#f6eee2";for(let i=0;i<13;i++){ctx.beginPath();ctx.arc((i%5)*9-18,Math.floor(i/5)*9-8,5,0,7);ctx.fill();}}
+    else if(item.name==="Nori"){ctx.fillStyle="#263a30";ctx.fillRect(-20,-16,40,32);ctx.fillStyle="#56705e";ctx.fillRect(-15,-11,30,22);}
+    else if(item.name==="Salmon"){ctx.fillStyle="#ed7898";ctx.beginPath();ctx.moveTo(-24,-12);ctx.lineTo(22,-16);ctx.lineTo(27,12);ctx.lineTo(-22,16);ctx.closePath();ctx.fill();ctx.strokeStyle="#ffd0d7";ctx.lineWidth=3;for(let i=-12;i<18;i+=9){ctx.beginPath();ctx.moveTo(i,-13);ctx.lineTo(i+8,14);ctx.stroke();}}
+    else if(item.name==="Cucumber"){ctx.fillStyle="#78a95b";ctx.beginPath();ctx.ellipse(0,0,22,15,0,0,7);ctx.fill();ctx.fillStyle="#c7dca1";ctx.beginPath();ctx.ellipse(0,0,13,8,0,0,7);ctx.fill();}
+    else if(item.name==="Egg"){ctx.fillStyle="#ffe09a";ctx.beginPath();ctx.ellipse(0,0,22,17,0,0,7);ctx.fill();ctx.fillStyle="#f5b94f";ctx.beginPath();ctx.arc(3,0,8,0,7);ctx.fill();}
+    else if(item.name==="Avocado"){ctx.fillStyle="#86b95f";ctx.beginPath();ctx.ellipse(0,0,23,15,.2,0,7);ctx.fill();ctx.fillStyle="#b5ce78";ctx.beginPath();ctx.ellipse(0,0,15,9,.2,0,7);ctx.fill();}
+    else if(item.name==="Tomato"){ctx.fillStyle="#df6d67";ctx.beginPath();ctx.arc(0,0,20,0,7);ctx.fill();}
+    else if(item.name==="Cheese"){ctx.fillStyle="#f1ca67";ctx.beginPath();ctx.moveTo(-22,14);ctx.lineTo(-12,-16);ctx.lineTo(22,10);ctx.closePath();ctx.fill();}
+    else if(item.name==="Strawberry"){ctx.fillStyle="#e96d83";ctx.beginPath();ctx.moveTo(0,-18);ctx.bezierCurveTo(24,-12,19,13,0,20);ctx.bezierCurveTo(-19,13,-24,-12,0,-18);ctx.fill();}
+    else {ctx.fillStyle="#d8a66b";ctx.fillRect(-22,-15,44,30);ctx.strokeStyle="#a97d4f";ctx.strokeRect(-22,-15,44,30);}
+    ctx.restore();
+  }
+
+  function drawShopping(t) {
+    drawBackground();
+    ctx.fillStyle="rgba(27,20,31,.58)"; ctx.fillRect(0,145,W,575);
+    text("Stage 1/4",640,35,17,"center","middle","#e7b5ca");
+    text("Shop for Ingredients",640,70,43,"center","middle","#fff","Georgia");
+    text("Collect the six sushi ingredients before the AI chef!",640,105,20,"center","middle","#d8d3df");
+
+    progressBar(485,135,300,"AI Chef",shopElapsedAI(),"#b9a0d3","◆");
+    progressBar(805,135,300,"You",shop.collected.length/requiredNames.length*100,"#f2a8bd","●");
+
+    const seconds=Math.max(0,elapsedSince(stageStart)+shop.penaltySeconds);
+    roundedRect(35,28,210,80,18,"rgba(56,37,54,.92)","#f2a8bd",2);
+    text("TIME",55,52,14,"left","middle","#d8d3df");
+    text(seconds.toFixed(1)+" s",55,88,34,"left","middle","#fff");
+
+    // shelves
+    roundedRect(250,175,820,330,20,"rgba(45,31,46,.86)","#b9a0d3",2);
+    ctx.fillStyle="rgba(242,168,189,.12)";
+    ctx.fillRect(250,250,820,8); ctx.fillRect(250,420,820,8);
+    for(const item of shop.items){
+      const hover=mouse.x>item.x-48&&mouse.x<item.x+48&&mouse.y>item.y-48&&mouse.y<item.y+48;
+      if(!item.collected){
+        roundedRect(item.x-48,item.y-48,96,96,12,hover?"rgba(242,168,189,.30)":"rgba(216,211,223,.10)",hover?"#f2a8bd":"rgba(216,211,223,.45)",2);
+        drawIngredientIcon(item,item.x,item.y-5);
+        text(item.name,item.x,item.y+38,12,"center","middle","#fff");
+      }
+    }
+
+    // shopping list
+    roundedRect(15,175,220,430,18,"rgba(56,37,54,.92)","#d8d3df",2);
+    text("SHOPPING LIST",125,205,16,"center","middle","#fff");
+    requiredNames.forEach((name,i)=>{
+      const y=250+i*52;
+      const got=shop.collected.includes(name);
+      ctx.beginPath(); ctx.arc(42,y,12,0,7);
+      ctx.fillStyle=got?"#f2a8bd":"rgba(216,211,223,.12)";ctx.fill();
+      ctx.strokeStyle=got?"#ffdce7":"#d8d3df";ctx.stroke();
+      if(got){ctx.beginPath();ctx.moveTo(36,y);ctx.lineTo(41,y+6);ctx.lineTo(50,y-7);ctx.strokeStyle="#fff";ctx.lineWidth=3;ctx.stroke();}
+      text(name,62,y+5,18,"left","middle",got?"#cfc4cf":"#fff");
+    });
+
+    // cart
+    roundedRect(1080,530,170,155,18,"rgba(56,37,54,.92)","#f2a8bd",2);
+    text("CART",1165,555,15,"center","middle","#fff");
+    ctx.save(); ctx.translate(1165,622);
+    ctx.strokeStyle="#d8d3df"; ctx.lineWidth=7;
+    ctx.beginPath();ctx.moveTo(-55,-35);ctx.lineTo(-40,25);ctx.lineTo(45,25);ctx.stroke();
+    ctx.beginPath();ctx.arc(-32,38,8,0,7);ctx.arc(38,38,8,0,7);ctx.fillStyle="#d8d3df";ctx.fill();
+    const collected=shop.collected;
+    for(let i=0;i<collected.length;i++){
+      ctx.fillStyle=shelfColors[i];ctx.beginPath();ctx.arc(-35+(i%3)*24,-20+Math.floor(i/3)*12,9,0,7);ctx.fill();
+    }
+    ctx.restore();
+
+    if(shop.wrongFlash>0){
+      roundedRect(470,535,340,55,18,"rgba(120,40,70,.94)","#ffb0bd",2);
+      text("WRONG ITEM!  +2 seconds",-0+640,562,23,"center","middle","#fff");
+      shop.wrongFlash--;
+    }
+    for(let i=shop.positiveFlash.length-1;i>=0;i--){
+      const p=shop.positiveFlash[i]; p.life--;
+      ctx.save();ctx.globalAlpha=Math.min(1,p.life/25);star(p.x,p.y,25-(p.life*.3),"#fff");ctx.restore();
+      if(p.life<=0)shop.positiveFlash.splice(i,1);
+    }
+    if(stageCompleteMessage&&gameState==="shop"){
+      roundedRect(430,300,420,100,24,"rgba(56,37,54,.96)","#f2a8bd",3);
+      text(stageCompleteMessage,640,350,34,"center","middle","#fff","Georgia");
+    }
+  }
+
+  function shopElapsedAI() {
+    if(!stageStart) return 0;
+    return elapsedSince(stageStart)/CONFIG.aiShopDuration*100;
+  }
+
+  function updateShopping(dt) {
+    if(shop.complete){
+      if(performance.now()>transitionUntil) {
+        stageCompleteMessage="";
+        startAssembly();
+      }
+      return;
+    }
+  }
+
+  function handleShopClick(mx,my) {
+    if(!shop.items||shop.complete)return;
+    for(const item of shop.items){
+      if(item.collected)continue;
+      if(mx>item.x-48&&mx<item.x+48&&my>item.y-48&&my<item.y+48){
+        if(item.required){
+          item.collected=true;
+          if(!shop.collected.includes(item.name))shop.collected.push(item.name);
+          shop.positiveFlash.push({x:item.x,y:item.y,life:30});
+          shop.cartBump=12;
+          if(shop.collected.length===requiredNames.length)finishShopping();
+        }else{
+          shop.penaltySeconds+=CONFIG.wrongItemPenalty;
+          shop.wrongFlash=70;
+        }
+        break;
+      }
+    }
+  }
+
+  // ==================== ASSEMBLY ====================
+  function nextAssemblyQuestion() {
+    assembly.question=null;
+    const ops=["+","-","×"];
+    const op=ops[Math.floor(Math.random()*ops.length)];
+    let a,b,answer;
+    if(op==="+"){a=randomInt(4,29);b=randomInt(3,18);answer=a+b;}
+    else if(op==="-"){a=randomInt(12,40);b=randomInt(2,a-1);answer=a-b;}
+    else{a=randomInt(2,12);b=randomInt(2,12);answer=a*b;}
+    assembly.question=`${a} ${op} ${b} = ?`;
+    const set=new Set([answer]);
+    while(set.size<4){
+      let delta=randomInt(-12,12);
+      if(delta===0)delta=2;
+      const candidate=answer+delta;
+      if(candidate>=0)set.add(candidate);
+    }
+    assembly.choices=[...set].sort(()=>Math.random()-.5);
+    assembly.selected=-1;
+    assembly.canAnswer=true;
+  }
+  function randomInt(a,b){return Math.floor(Math.random()*(b-a+1))+a;}
+
+  function answerAssembly(choiceIndex) {
+    if(!assembly.canAnswer)return;
+    assembly.selected=choiceIndex;
+    assembly.canAnswer=false;
+    const correctChoice=Number(assembly.choices[choiceIndex])===getAssemblyAnswer();
+    stats.assemblyAttempts++;
+    if(correctChoice){
+      stats.assemblyCorrect++;
+      assembly.step++;
+      assembly.feedback="Correct!";
+      assembly.feedbackKind="correct";
+      if(assembly.step>=CONFIG.ingredientsPerRoll){
+        assembly.roll++;
+        assembly.step=0;
+        assembly.feedback="Roll Complete!";
+        assembly.feedbackKind="correct";
+      }
+    }else{
+      assembly.feedback="Incorrect!";
+      assembly.feedbackKind="incorrect";
+    }
+    assembly.feedbackUntil=performance.now()+850;
+  }
+
+  function getAssemblyAnswer(){
+    const parts=assembly.question.match(/-?\d+/g).map(Number);
+    if(assembly.question.includes("×"))return parts[0]*parts[1];
+    if(assembly.question.includes("+"))return parts[0]+parts[1];
+    return parts[0]-parts[1];
+  }
+
+  function assemblyHumanProgress(){
+    return ((assembly.roll*CONFIG.ingredientsPerRoll+assembly.step)/(CONFIG.requiredRolls*CONFIG.ingredientsPerRoll))*100;
+  }
+
+  function drawAssembly(t) {
+    drawBackground();
+    ctx.fillStyle="rgba(70,44,67,.34)";
+    ctx.fillRect(0,145,W,575);
+    roundedRect(35,30,205,95,18,"rgba(56,37,54,.88)","#f2a8bd",2);
+    text("ACCURACY",137,58,16,"center","middle","#d8d3df");
+    const acc=stats.assemblyAttempts?stats.assemblyCorrect/stats.assemblyAttempts*100:100;
+    text(acc.toFixed(0)+"%",137,98,42,"center","middle","#fff","Georgia");
+
+    text("Stage 2/4",640,35,17,"center","middle","#e7b5ca");
+    text("Assemble the Sushi Rolls",640,75,47,"center","middle","#fff","Georgia");
+    text("Answer the math questions to add the next ingredient!",640,112,20,"center","middle","#d8d3df");
+    progressBar(485,145,300,"AI Chef",elapsedSince(stageStart)/CONFIG.aiAssemblyDuration*100,"#b9a0d3","◆");
+    progressBar(805,145,300,"You",assemblyHumanProgress(),"#f2a8bd","●");
+
+    // checklist
+    roundedRect(30,175,230,390,18,"rgba(56,37,54,.82)","#d8d3df",2);
+    const labels=["Nori","Sushi rice","Salmon","Cucumber / egg"];
+    ctx.strokeStyle="#d8d3df";ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(82,232);ctx.lineTo(82,500);ctx.stroke();
+    for(let i=0;i<4;i++){
+      const y=252+i*82;
+      ctx.beginPath();ctx.arc(82,y,15,0,7);
+      ctx.fillStyle=(i<assembly.step)?"#f2a8bd":"rgba(216,211,223,.10)";
+      ctx.fill();ctx.stroke();
+      if(i<assembly.step){
+        ctx.beginPath();ctx.moveTo(74,y);ctx.lineTo(80,y+6);ctx.lineTo(92,y-8);ctx.strokeStyle="#fff";ctx.lineWidth=3;ctx.stroke();
+      }
+      roundedRect(108,y-31,128,62,10,"rgba(216,211,223,.10)","rgba(216,211,223,.40)",2);
+      text(labels[i],172,y+2,14,"center","middle","#fff");
+    }
+
+    // math card
+    roundedRect(300,175,760,230,24,"rgba(86,52,79,.82)","#d8d3df",3);
+    text(assembly.question,680,245,54,"center","middle","#fff","Georgia");
+    const bw=150,bh=58,gap=24,startX=680-(4*bw+3*gap)/2;
+    assembly.choices.forEach((choice,i)=>{
+      const x=startX+i*(bw+gap), y=310;
+      let fill="rgba(216,211,223,.13)",stroke="rgba(216,211,223,.55)";
+      if(assembly.selected===i){
+        const correct=choice===getAssemblyAnswer();
+        fill=correct?"rgba(242,168,189,.72)":"rgba(190,82,105,.72)";
+        stroke=correct?"#ffdce7":"#ff9eb2";
+      }
+      const hover=mouse.x>x&&mouse.x<x+bw&&mouse.y>y&&mouse.y<y+bh;
+      if(hover&&assembly.canAnswer){fill="rgba(242,168,189,.30)";stroke="#ffdce7";}
+      roundedRect(x,y,bw,bh,12,fill,stroke,2);
+      text(String(choice),x+bw/2,y+bh/2+2,30,"center","middle","#fff");
+    });
+    if(assembly.feedback&&performance.now()<assembly.feedbackUntil){
+      text(assembly.feedback,680,430,32,"center","middle",assembly.feedbackKind==="correct"?"#ffdce7":"#ff9eb2","Georgia");
+    }
+
+    // mat and partially assembled roll
+    roundedRect(300,465,760,210,16,"rgba(120,78,67,.72)","#e5a08a",2);
+    ctx.fillStyle="#cf755f";
+    for(let x=325;x<1035;x+=42){ctx.fillRect(x,500,30,150);}
+    ctx.strokeStyle="rgba(80,42,48,.35)";
+    for(let x=325;x<1035;x+=42){ctx.beginPath();ctx.moveTo(x,500);ctx.lineTo(x,650);ctx.stroke();}
+    drawAssemblyRoll(680,575);
+    text(`Roll ${Math.min(assembly.roll+1,CONFIG.requiredRolls)}/${CONFIG.requiredRolls}`,1060,665,18,"right","middle","#fff");
+
+    if(stageCompleteMessage&&gameState==="assembly"){
+      roundedRect(430,300,420,100,24,"rgba(56,37,54,.96)","#f2a8bd",3);
+      text(stageCompleteMessage,640,350,34,"center","middle","#fff","Georgia");
+    }
+  }
+
+  function drawAssemblyRoll(cx,cy) {
+    ctx.save();
+    roundedRect(cx-355,cy-82,710,164,16,"#cbbcae","#e7b5ca",3);
+    ctx.fillStyle="#302029";ctx.fillRect(cx-335,cy-62,670,124);
+    ctx.fillStyle="#f5ede2";
+    for(let i=0;i<50;i++){ctx.beginPath();ctx.arc(cx-315+(i%25)*27,cy-48+Math.floor(i/25)*56,10,0,7);ctx.fill();}
+    let step=assembly.step;
+    if(step>=1)ctx.fillStyle="#263b32",ctx.fillRect(cx-300,cy-52,600,26);
+    if(step>=2)ctx.fillStyle="#f5ede2",ctx.fillRect(cx-300,cy-26,600,28);
+    if(step>=3)ctx.fillStyle="#ed7898",ctx.fillRect(cx-300,cy+2,600,28);
+    if(step>=4){
+      ctx.fillStyle="#86b95f";ctx.fillRect(cx-300,cy+30,300,20);
+      ctx.fillStyle="#ffd98a";ctx.fillRect(cx,cy+30,300,20);
+      ctx.fillStyle="#3a2933";ctx.fillRect(cx-300,cy-62,600,124);
+      ctx.fillStyle="#f5ede2";
+      for(let i=0;i<50;i++){ctx.beginPath();ctx.arc(cx-315+(i%25)*27,cy-48+Math.floor(i/25)*56,10,0,7);ctx.fill();}
+    }
+    ctx.restore();
+  }
+
+  function updateAssembly(dt) {
+    if(assembly.roll>=CONFIG.requiredRolls){
+      if(!transitionUntil)finishAssembly();
+      if(performance.now()>transitionUntil){
+        stageCompleteMessage="";
+        startCutting();
+      }
+    }else if(assembly.feedbackUntil&&performance.now()>assembly.feedbackUntil){
+      if(assembly.feedbackKind){
+        assembly.feedback="";
+        assembly.feedbackKind="";
+        nextAssemblyQuestion();
+      }
+    }
+  }
+
+  function handleAssemblyClick(mx,my) {
+    if(!assembly.canAnswer)return;
+    const bw=150,bh=58,gap=24,startX=680-(4*bw+3*gap)/2,y=310;
+    assembly.choices.forEach((choice,i)=>{
+      const x=startX+i*(bw+gap);
+      if(mx>x&&mx<x+bw&&my>y&&my<y+bh)answerAssembly(i);
+    });
+  }
+
+  // ==================== CUTTING ====================
+  function spawnCuttingRoll() {
+    if(cutting.roll>=CONFIG.requiredRolls)return;
+    cutting.activeRoll={
+      x:-180,
+      width:310,
+      guidelines:[-105,-35,35,105].map(off=>({off,resolved:false,world:-180+off}))
+    };
+  }
+
+  function cuttingHumanProgress() {
+    return (stats.cuttingResolved/(CONFIG.requiredRolls*CONFIG.ingredientsPerRoll))*100;
+  }
+
+  function drawCutting(t) {
+    drawBackground();
+    text("Stage 3/4",640,35,17,"center","middle","#e7b5ca");
+    text("Cut the Rolls",640,75,43,"center","middle","#fff","Georgia");
+    text("Press SPACE when a cutting guideline lines up with the knife!",640,112,20,"center","middle","#d8d3df");
+
+    const acc=stats.cuttingAttempts?stats.cuttingCorrect/stats.cuttingAttempts*100:100;
+    roundedRect(35,30,205,95,18,"rgba(56,37,54,.88)","#f2a8bd",2);
+    text("ACCURACY",137,58,16,"center","middle","#d8d3df");
+    text(acc.toFixed(0)+"%",137,98,42,"center","middle","#fff","Georgia");
+    progressBar(485,145,300,"AI Chef",elapsedSince(stageStart)/CONFIG.aiCutDuration*100,"#b9a0d3","◆");
+    progressBar(805,145,300,"You",cuttingHumanProgress(),"#f2a8bd","●");
+
+    // conveyor
+    ctx.fillStyle="#312634";ctx.fillRect(0,275,W,310);
+    ctx.fillStyle="#d4cdd6";ctx.fillRect(0,520,W,65);
+    ctx.fillStyle="#8d7c8d";
+    for(let x=-((t*.1)%70);x<W;x+=70){roundedRect(x,540,48,18,8,"#b5aab5",null);}
+    ctx.fillStyle="#18131a";
+    ctx.fillRect(0,585,W,135);
+    ctx.fillStyle="#4b3547";
+    for(let i=0;i<16;i++)ctx.fillRect(i*90,585,50,135);
+
+    // belt rail
+    ctx.fillStyle="#9f929d";ctx.fillRect(0,270,W,16);
+    ctx.fillStyle="#d8d3df";ctx.fillRect(0,520,W,12);
+
+    if(cutting.activeRoll){
+      const r=cutting.activeRoll;
+      ctx.save();
+      roundedRect(r.x-r.width/2,360,r.width,120,18,"#252029","#d8d3df",3);
+      ctx.fillStyle="#f5ede2";ctx.fillRect(r.x-r.width/2+20,380,r.width-40,80);
+      ctx.fillStyle="#ef7d99";ctx.fillRect(r.x-r.width/2+20,420,r.width-40,24);
+      ctx.fillStyle="#86b95f";ctx.fillRect(r.x-r.width/2+20,404,r.width-40,16);
+      for(const g of r.guidelines){
+        g.world=r.x+g.off;
+        ctx.strokeStyle=g.resolved?"#f2a8bd":"rgba(255,255,255,.88)";
+        ctx.setLineDash(g.resolved?[]:[8,7]);ctx.lineWidth=3;
+        ctx.beginPath();ctx.moveTo(g.world,340);ctx.lineTo(g.world,500);ctx.stroke();ctx.setLineDash([]);
+        if(g.resolved){ctx.beginPath();ctx.arc(g.world,420,8,0,7);ctx.fillStyle="#f2a8bd";ctx.fill();}
+      }
+      ctx.restore();
+    }
+
+    // knife fixed position
+    ctx.strokeStyle="rgba(242,168,189,.55)";
+    ctx.setLineDash([10,8]);ctx.beginPath();ctx.moveTo(640,220);ctx.lineTo(640,520);ctx.stroke();ctx.setLineDash([]);
+    ctx.save();ctx.translate(640,cutting.knifePhase>0?300:235);
+    ctx.rotate(.15);
+    ctx.fillStyle="#d8d3df";ctx.beginPath();ctx.moveTo(-60,-18);ctx.quadraticCurveTo(0,-32,55,-6);ctx.lineTo(42,30);ctx.quadraticCurveTo(-10,12,-60,-18);ctx.fill();
+    ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.stroke();
+    ctx.restore();
+
+    text(`Cut ${stats.cuttingAttempts}/${CONFIG.requiredRolls*CONFIG.ingredientsPerRoll}`,100,675,18,"left","middle","#d8d3df");
+    text(`Roll ${Math.min(cutting.roll+1,CONFIG.requiredRolls)}/${CONFIG.requiredRolls}`,1180,675,18,"right","middle","#fff");
+
+    if(cutting.feedback&&performance.now()<cutting.feedbackUntil){
+      text(cutting.feedback,640,190,34,"center","middle",cutting.feedbackKind==="good"?"#ffdce7":"#ff9eb2","Georgia");
+    }
+    if(stageCompleteMessage&&gameState==="cutting"){
+      roundedRect(430,300,420,100,24,"rgba(56,37,54,.96)","#f2a8bd",3);
+      text(stageCompleteMessage,640,350,34,"center","middle","#fff","Georgia");
+    }
+  }
+
+  function updateCutting(dt) {
+    if(cutting.roll>=CONFIG.requiredRolls){
+      if(!transitionUntil)finishCutting();
+      if(performance.now()>transitionUntil){
+        stageCompleteMessage="";
+        startServing();
+      }
+      return;
+    }
+    if(cutting.knifePhase>0)cutting.knifePhase-=dt*4;
+    if(cutting.activeRoll){
+      const r=cutting.activeRoll;
+      r.x+=CONFIG.conveyorSpeed*dt;
+      for(const g of r.guidelines){
+        if(!g.resolved&&g.world<640-CONFIG.cuttingTolerance){
+          g.resolved=true;
+          stats.cuttingAttempts++;
+          stats.cuttingResolved++;
+          setCutFeedback("Too Late!","miss");
+        }
+      }
+      if(r.x-r.width/2>W+40){
+        cutting.roll++;
+        if(cutting.roll<CONFIG.requiredRolls)spawnCuttingRoll();
+        else cutting.activeRoll=null;
+      }
+    }
+  }
+
+  function setCutFeedback(msg,kind) {
+    cutting.feedback=msg;cutting.feedbackKind=kind==="good"?"good":"miss";
+    cutting.feedbackUntil=performance.now()+650;
+  }
+
+  function handleCutKey() {
+    cutting.knifePhase=1;
+    if(cutting.activeRoll){
+      let nearest=null,nearestDistance=Infinity;
+      for(const g of cutting.activeRoll.guidelines){
+        if(g.resolved)continue;
+        const d=Math.abs(g.world-640);
+        if(d<nearestDistance){nearest=g;nearestDistance=d;}
+      }
+      if(nearest&&nearestDistance<=CONFIG.cuttingTolerance){
+        nearest.resolved=true; stats.cuttingAttempts++;stats.cuttingCorrect++;
+        stats.cuttingResolved++;
+        const quality=nearestDistance<24?"Perfect!":"Good!";
+        setCutFeedback(quality,"good");
+        cutting.sliceFlash.push({x:nearest.world,y:420,life:30});
+      }else{
+        stats.cuttingAttempts++;
+        setCutFeedback(nearest&&nearest.world<640?"Too Late!":"Too Early!","miss");
+      }
+    }
+  }
+
+  // ==================== SERVING ====================
+  const obstacles=[
+    {x:230,y:190,w:220,h:105},
+    {x:760,y:200,w:220,h:105},
+    {x:430,y:430,w:240,h:90},
+    {x:865,y:430,w:165,h:105},
+    {x:180,y:470,w:180,h:105}
+  ];
+
+  function circleRectCollides(cx,cy,r,rect){
+    const nearX=clamp(cx,rect.x,rect.x+rect.w),nearY=clamp(cy,rect.y,rect.y+rect.h);
+    return (cx-nearX)**2+(cy-nearY)**2<r*r;
+  }
+
+  function moveServing(dt){
+    let dx=0,dy=0;
+    if(keys.w||keys.arrowup)dy-=1;
+    if(keys.s||keys.arrowdown)dy+=1;
+    if(keys.a||keys.arrowleft)dx-=1;
+    if(keys.d||keys.arrowright)dx+=1;
+    if(dx||dy){
+      const len=Math.hypot(dx,dy);dx/=len;dy/=len;
+      const p=serving.player;
+      const nx=clamp(p.x+dx*CONFIG.playerSpeed*dt,p.r, W-p.r);
+      const ny=clamp(p.y+dy*CONFIG.playerSpeed*dt,p.r,H-p.r);
+      let blocked=false;
+      for(const o of obstacles){if(circleRectCollides(nx,p.y,p.r,o)){blocked=true;break;} }
+      if(!blocked)p.x=nx;
+      blocked=false;
+      for(const o of obstacles){if(circleRectCollides(p.x,ny,p.r,o)){blocked=true;break;} }
+      if(!blocked)p.y=ny;
+    }
+  }
+
+  function drawServing(t) {
+    drawBackground();
+    text("Stage 4/4",640,35,17,"center","middle","#e7b5ca");
+    text("Serving the Sushi",640,75,43,"center","middle","#fff","Georgia");
+    text("Use WASD to move • Press ENTER near a highlighted customer",640,112,20,"center","middle","#d8d3df");
+
+    const seconds=elapsedSince(stageStart);
+    roundedRect(35,30,205,80,18,"rgba(56,37,54,.88)","#f2a8bd",2);
+    text("TIME",137,55,15,"center","middle","#d8d3df");
+    text(seconds.toFixed(1)+" s",137,92,32,"center","middle","#fff");
+    progressBar(485,145,300,"AI Chef",elapsedSince(stageStart)/CONFIG.aiServeDuration*100,"#b9a0d3","◆");
+    progressBar(805,145,300,"You",serving.served/CONFIG.requiredCustomers*100,"#f2a8bd","●");
+
+    // restaurant floor
+    ctx.fillStyle="#3a2938";ctx.fillRect(0,175,W,545);
+    ctx.fillStyle="#4a3547";
+    for(let y=175;y<H;y+=55)for(let x=0;x<W;x+=55){
+      ctx.fillRect(x,y,52,52);
+    }
+    // counter
+    ctx.fillStyle="#6d4d63";ctx.fillRect(0,175,W,70);
+    ctx.fillStyle="#c2a5b5";ctx.fillRect(0,175,W,10);
+    text("SUSHI BAR",100,218,22,"left","middle","#fff","Georgia");
+
+    // obstacles/tables
+    for(const o of obstacles){
+      roundedRect(o.x,o.y,o.w,o.h,16,"rgba(112,78,99,.95)","#d8d3df",2);
+      ctx.fillStyle="#d9a07b";
+      ctx.beginPath();ctx.ellipse(o.x+o.w/2,o.y+o.h/2,o.w*.34,o.h*.28,0,0,7);ctx.fill();
+      ctx.fillStyle="#382536";
+      ctx.fillRect(o.x+25,o.y+o.h+8,24,28);ctx.fillRect(o.x+o.w-49,o.y+o.h+8,24,28);
+    }
+
+    // pedestrians
+    for(const p of serving.pedestrians){
+      ctx.fillStyle="#b9a0d3";ctx.beginPath();ctx.arc(p.x,p.y,13,0,7);ctx.fill();
+      ctx.fillStyle="#d8d3df";ctx.fillRect(p.x-8,p.y+10,16,24);
+    }
+
+    // customers
+    for(const c of serving.customers){
+      if(!c.served){
+        ctx.save();ctx.globalAlpha=.4+.25*Math.sin(t/180);
+        ctx.beginPath();ctx.arc(c.x,c.y,31,0,7);ctx.fillStyle=c.color;ctx.fill();ctx.restore();
+        ctx.beginPath();ctx.arc(c.x,c.y,18,0,7);ctx.fillStyle=c.color;ctx.fill();
+        ctx.fillStyle="#382536";ctx.beginPath();ctx.arc(c.x,c.y-5,8,0,7);ctx.fill();
+        ctx.strokeStyle="#fff";ctx.lineWidth=3;
+        ctx.beginPath();ctx.moveTo(c.x-20,c.y+26);ctx.lineTo(c.x,c.y+12);ctx.lineTo(c.x+20,c.y+26);ctx.stroke();
+      }else{
+        ctx.fillStyle="#6f6170";ctx.beginPath();ctx.arc(c.x,c.y,16,0,7);ctx.fill();
+        ctx.fillStyle="#f2a8bd";ctx.beginPath();ctx.arc(c.x,c.y-3,7,0,7);ctx.fill();
+      }
+    }
+
+    // player
+    const p=serving.player;
+    ctx.fillStyle="#f2a8bd";ctx.beginPath();ctx.arc(p.x,p.y,16,0,7);ctx.fill();
+    ctx.fillStyle="#fff";ctx.fillRect(p.x-9,p.y-6,18,8);
+    ctx.fillStyle="#382536";ctx.beginPath();ctx.arc(p.x,p.y-1,5,0,7);ctx.fill();
+    ctx.fillStyle="#fff";ctx.beginPath();ctx.ellipse(p.x,p.y+22,9,12,0,0,7);ctx.fill();
+
+    // proximity prompt
+    let near=null;
+    for(const c of serving.customers){
+      if(!c.served&&Math.hypot(p.x-c.x,p.y-c.y)<65){near=c;break;}
+    }
+    if(near){
+      roundedRect(near.x-125,near.y-72,250,38,12,"rgba(56,37,54,.94)","#f2a8bd",2);
+      text("Press ENTER to Serve",near.x,near.y-53,16,"center","middle","#fff");
+    }
+
+    if(serving.feedback&&performance.now()<serving.feedbackUntil){
+      text(serving.feedback,640,160,24,"center","middle","#ffcad8","Georgia");
+    }
+    if(stageCompleteMessage&&gameState==="serving"){
+      roundedRect(430,300,420,100,24,"rgba(56,37,54,.96)","#f2a8bd",3);
+      text(stageCompleteMessage,640,350,34,"center","middle","#fff","Georgia");
+    }
+  }
+
+  function updateServing(dt) {
+    for(const p of serving.pedestrians){
+      p.x+=p.dx*dt;
+      if(p.x<p.range[0]||p.x>p.range[1])p.dx*=-1;
+    }
+    moveServing(dt);
+    if(serving.served>=CONFIG.requiredCustomers){
+      if(!transitionUntil)finishServing();
+      if(performance.now()>transitionUntil){
+        stageCompleteMessage="";
+        toEnding();
+      }
+    }
+  }
+
+  function handleServe() {
+    if(serving.served>=CONFIG.requiredCustomers)return;
+    const p=serving.player;
+    let target=null;
+    for(const c of serving.customers){
+      if(!c.served&&Math.hypot(p.x-c.x,p.y-c.y)<65){target=c;break;}
+    }
+    if(target){
+      target.served=true;serving.served++;
+      serving.feedback="Order Delivered!";
+      serving.feedbackUntil=performance.now()+900;
+    }else{
+      serving.feedback="Too far away!";
+      serving.feedbackUntil=performance.now()+900;
+    }
+  }
+
+  // ==================== ENDING ====================
+  function aiFinalBar(stage) {
+    if(stage==="shop")return shopElapsedAI();
+    if(stage==="assembly")return elapsedSince(stageStart)/CONFIG.aiAssemblyDuration*100;
+    if(stage==="cutting")return elapsedSince(stageStart)/CONFIG.aiCutDuration*100;
+    if(stage==="serving")return elapsedSince(stageStart)/CONFIG.aiServeDuration*100;
+    return 100;
+  }
+
+  function drawEnding(t) {
+    drawBackground();
+    ctx.fillStyle="rgba(28,17,29,.78)";ctx.fillRect(0,0,W,H);
+    ctx.strokeStyle="rgba(242,168,189,.28)";
+    ctx.lineWidth=2;
+    for(let i=0;i<8;i++){ctx.beginPath();ctx.arc(1050,130+i*65,220+i*20,0,7);ctx.stroke();}
+
+    text("AI CHEF WINS",640,62,20,"center","middle","#b9a0d3");
+    text("YOU'RE FIRED!",640,120,64,"center","middle","#f2a8bd","Georgia");
+    text("The restaurant chose the AI chef for efficiency.",640,160,21,"center","middle","#d8d3df");
+
+    // comparison bars
+    progressBar(350,210,580,"AI Chef",100,"#b9a0d3","◆");
+    progressBar(350,270,580,"You",100,"#f2a8bd","●");
+
+    // stage indicators
+    const stages=["SHOP","ASSEMBLE","CUT","SERVE"];
+    for(let i=0;i<4;i++){
+      const x=390+i*170;
+      ctx.beginPath();ctx.arc(x,330,22,0,7);ctx.fillStyle="#f2a8bd";ctx.fill();
+      ctx.strokeStyle="#fff";ctx.lineWidth=3;
+      ctx.beginPath();ctx.moveTo(x-8,330);ctx.lineTo(x-1,337);ctx.lineTo(x+10,322);ctx.stroke();
+      text(stages[i],x,362,12,"center","middle","#d8d3df");
+    }
+
+    roundedRect(80,410,1120,170,20,"rgba(56,37,54,.82)","#d8d3df",2);
+    const assemblyAcc=stats.assemblyAccuracy||0;
+    const cuttingAcc=stats.cuttingAccuracy||0;
+    const total=elapsedSince(sessionStart);
+    const results=[
+      ["Shopping",stats.shopTime===null?"—":stats.shopTime.toFixed(1)+" s"],
+      ["Assembly",assemblyAcc.toFixed(0)+"%"],
+      ["Cutting",cuttingAcc.toFixed(0)+"%"],
+      ["Serving",stats.servingTime===null?"—":stats.servingTime.toFixed(1)+" s"],
+      ["Total",total.toFixed(1)+" s"]
+    ];
+    for(let i=0;i<results.length;i++){
+      const x=150+i*240;
+      text(results[i][0],x,448,14,"center","middle","#d8d3df");
+      text(results[i][1],x,496,28,"center","middle","#fff","Georgia");
+    }
+
+    text("AI: automated shopping • 38-step assembly • precise cutting • rapid serving",640,608,16,"center","middle","#b9a0d3");
+
+    const bx=460,by=625,bw=360,bh=72;
+    const hover=mouse.x>=bx&&mouse.x<=bx+bw&&mouse.y>=by&&mouse.y<=by+bh;
+    ctx.shadowBlur=hover?30:15;ctx.shadowColor="#f2a8bd";
+    roundedRect(bx,by,bw,bh,18,hover?"#ffadc5":"#df8faa","#ffdce7",3);ctx.shadowBlur=0;
+    text("TRY AGAIN",bx+bw/2,by+bh/2+2,30,"center","middle","#fff","Georgia");
+
+    star(1060,90,16,"#fff");star(220,170,12,"#f2a8bd");
+  }
+
+  // ==================== INPUT ====================
+  canvas.addEventListener("mousemove",e=>{
+    const r=canvas.getBoundingCanvasRect?.()||canvas.getBoundingClientRect();
+    mouse.x=(e.clientX-r.left)*W/r.width;
+    mouse.y=(e.clientY-r.top)*H/r.height;
+  });
+  canvas.addEventListener("mousedown",e=>{
+    e.preventDefault();
+    if(paused)return;
+    const r=canvas.getBoundingClientRect();
+    mouse.x=(e.clientX-r.left)*W/r.width;
+    mouse.y=(e.clientY-r.top)*H/r.height;
+    mouse.down=true;
+    if(gameState==="menu"){
+      if(mouse.x>=450&&mouse.x<=830&&mouse.y>=475&&mouse.y<=565)beginGame();
+    }else if(gameState==="shop"){
+      handleShopClick(mouse.x,mouse.y);
+    }else if(gameState==="assembly"){
+      handleAssemblyClick(mouse.x,mouse.y);
+    }else if(gameState==="ending"){
+      if(mouse.x>=460&&mouse.x<=820&&mouse.y>=625&&mouse.y<=697)resetGame();
+    }
+  });
+  canvas.addEventListener("mouseup",()=>mouse.down=false);
+  canvas.addEventListener("touchstart",e=>{
+    e.preventDefault();
+    if(paused)return;
+    const t=e.changedTouches[0],r=canvas.getBoundingClientRect();
+    mouse.x=(t.clientX-r.left)*W/r.width;mouse.y=(t.clientY-r.top)*H/r.height;
+    if(gameState==="menu"&&mouse.x>=450&&mouse.x<=830&&mouse.y>=475&&mouse.y<=565)beginGame();
+    else if(gameState==="shop")handleShopClick(mouse.x,mouse.y);
+    else if(gameState==="assembly")handleAssemblyClick(mouse.x,mouse.y);
+    else if(gameState==="ending"&&mouse.x>=460&&mouse.x<=820&&mouse.y>=625&&mouse.y<=697)resetGame();
+  },{passive:false});
+
+  window.addEventListener("keydown",e=>{
+    const k=e.key.toLowerCase();
+    if([" ","arrowup","arrowdown","arrowleft","arrowright"].includes(k)||k==="enter")e.preventDefault();
+    if(k==="p"&&gameState!=="menu"){togglePause();return;}
+    if(paused)return;
+    if(gameState==="cutting"&&k===" "&&!keys[" "]){
+      handleCutKey();
+    }
+    if(gameState==="serving"&&k==="enter"&&!enterPressed){
+      enterPressed=true;handleServe();
+    }
+    keys[k]=true;
+  });
+  window.addEventListener("keyup",e=>{
+    const k=e.key.toLowerCase();
+    keys[k]=false;
+    if(k==="enter")enterPressed=false;
+  });
+  window.addEventListener("blur",()=>{
+    keys={};
+    enterPressed=false;
+    mouse.down=false;
+  });
+
+  // ==================== MAIN LOOP ====================
+  function frame(now) {
+    const dt=Math.min(.033,(now-lastTime)/1000||0);
+    lastTime=now;
+    if(!paused){
+      if(gameState==="shop")updateShopping(dt);
+      else if(gameState==="assembly")updateAssembly(dt);
+      else if(gameState==="cutting")updateCutting(dt);
+      else if(gameState==="serving")updateServing(dt);
+    }
+
+    ctx.clearRect(0,0,W,H);
+    if(gameState==="menu")drawMainMenu(now);
+    else if(gameState==="shop")drawShopping(now);
+    else if(gameState==="assembly")drawAssembly(now);
+    else if(gameState==="cutting")drawCutting(now);
+    else if(gameState==="serving")drawServing(now);
+    else if(gameState==="ending")drawEnding(now);
+
+    if(paused){
+      ctx.fillStyle="rgba(20,13,22,.72)";ctx.fillRect(0,0,W,H);
+      roundedRect(440,290,400,140,20,"rgba(56,37,54,.96)","#f2a8bd",3);
+      text("PAUSED",640,340,42,"center","middle","#fff","Georgia");
+      text("Press P to continue",640,390,20,"center","middle","#d8d3df");
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // Initialize
+  requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
